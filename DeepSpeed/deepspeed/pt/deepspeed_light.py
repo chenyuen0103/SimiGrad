@@ -32,6 +32,14 @@ from deepspeed.pt.deepspeed_constants import \
 import deepspeed.pt.deepspeed_lr_schedules as lr_schedules
 from deepspeed.pt.deepspeed_csr_tensor import CSRTensor
 
+from collections import defaultdict
+import time
+import numpy as np
+import math
+
+import itertools
+
+
 MEMORY_OPT_ALLREDUCE_SIZE = 500000000
 SUMMARY_WRITER_DIR_NAME = "JobId"
 
@@ -50,6 +58,42 @@ except ImportError:
     from torch._utils import _unflatten_dense_tensors as unflatten
 
 
+def gather_grad(parameters):
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    if len(parameters) == 0:
+        return torch.tensor(0.)
+    total_norm = torch.cat([p.grad.detach().view(-1) for p in parameters])
+    return total_norm
+
+def merge_grad(parameters):
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    if len(parameters) == 0:
+        return torch.tensor(0.)
+    total_norm = torch.cat([p.detach().view(-1) for p in parameters])
+    return total_norm
+
+def gather_grouped_grad(parameters):
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    # parameters = list(filter(lambda p: p.grad is not None, parameters))
+    # if len(parameters) == 0:
+    #     return torch.tensor(0.)
+    total_norm = torch.cat([p[1].grad.detach().view(-1) for p in parameters])
+    return total_norm
+
+def gather_grouped_weight(parameters):
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    # parameters = list(filter(lambda p: p.grad is not None, parameters))
+    # if len(parameters) == 0:
+    #     return torch.tensor(0.)
+    total_norm = torch.cat([p[1].data.detach().view(-1) for p in parameters])
+    return total_norm
+
+
 def split_half_float_double_csr(tensors):
     dtypes = [
         "torch.cuda.HalfTensor",
@@ -65,7 +109,7 @@ def split_half_float_double_csr(tensors):
     return buckets
 
 
-def _initialize_parameter_parallel_groups(parameter_parallel_size=None):
+def _initialize_parameter_parallel_groups(parameter_parallel_size=None):# qy: basically if parameter_parallel_size unset then all replicas will be put into one single group
     data_parallel_size = int(dist.get_world_size())
     if parameter_parallel_size is None:
         parameter_parallel_size = int(data_parallel_size)
@@ -102,7 +146,8 @@ class DeepSpeedLight(Module):
                  mpu=None,
                  dist_init_required=None,
                  collate_fn=None,
-                 config_params=None):
+                 config_params=None,
+                 adaptive_batch_params=None):
         super(DeepSpeedLight, self).__init__()
 
         logging.basicConfig(level=logging.INFO,
@@ -138,6 +183,7 @@ class DeepSpeedLight(Module):
                 logging.warning(
                     "Was given dist_init_required=True but detected that torch"
                     "distributed was already initialized, cannot initialize twice.")
+
 
         self._do_args_sanity_check(args)
         self._configure_with_arguments(args, mpu)
@@ -184,6 +230,45 @@ class DeepSpeedLight(Module):
         self.save_non_zero_checkpoint = False
         self.save_zero_checkpoint = False
         self._configure_checkpointing(dist_init_required)
+
+
+        #qy: init
+        if adaptive_batch_params is not None:
+            self.adaptive_batch_params=defaultdict(lambda: None,adaptive_batch_params)
+            if self.adaptive_batch_params["batch_size_upper_bound"] is not None:
+                assert self.adaptive_batch_params["batch_size_upper_bound"]>=1
+            if self.adaptive_batch_params["batch_size_lower_bound"] is not None:
+                assert self.adaptive_batch_params["batch_size_lower_bound"]>=1
+            if self.adaptive_batch_params["batch_size_lower_bound"] is not None and self.adaptive_batch_params["batch_size_upper_bound"] is not None:
+                assert self.adaptive_batch_params["batch_size_upper_bound"]>=self.adaptive_batch_params["batch_size_lower_bound"]
+            self.adaptive_batch_params["global_lr_modifier"]=1.0
+        else:
+            self.adaptive_batch_params=defaultdict(lambda: None)
+        self.gradient_accumulation_offset=0
+        self.gradient_step_size=max(int(self.gradient_accumulation_steps()/10),1)
+        # self.adaptive_batch_params["original_batch_size"]=self.gradient_accumulation_steps()
+        self.adaptive_batch_params["original_batch_size"]=self.train_batch_size()
+        self.adaptive_batch_params["batch_size_similiarity_record"]=dict()
+        self.gradient_accumulation_start=0
+        self.sub_groups_idx=[[] for _ in range(2)]
+        self.sub_groups=[]
+        assert torch.distributed.get_world_size()%2==0
+        for i in range(torch.distributed.get_world_size()):
+            self.sub_groups_idx[i%2].append(i)
+        # if(torch.distributed.get_world_size())>1:
+        #     self.sub_groups_idx.append([torch.distributed.get_world_size()-1,0])
+        print(self.sub_groups_idx)
+        for idx in self.sub_groups_idx:
+            self.sub_groups.append(torch.distributed.new_group(idx))
+        self.sub_groups.append(torch.distributed.new_group([0,1]))
+        self.grad_placeholder=None #need to be initialized later because the model is not initalized at this point
+        self.cos_placeholder=torch.rand(1).cuda()
+        self.adjust_direction=0
+        if self.adaptive_batch_params["inconsistent_lr_below_lower_bound"] is True:
+            self.latent_batch_size=self.gradient_accumulation_steps()
+        else:
+            self.latent_batch_size=None
+        self.adapt_print(self.adaptive_batch_params)
 
         if self.global_rank == 0:
             self._config.print('DeepSpeedLight configuration')
@@ -699,6 +784,7 @@ class DeepSpeedLight(Module):
                 self.optimizer.overlapping_partition_gradients_reduce_epilogue()
             else:
                 self.buffered_allreduce_fallback(elements_per_buffer=bucket_size)
+                # print("the allreduce fallback is used.")
 
     def backward(self, loss, allreduce_gradients=True):
         r"""Execute backward pass on the loss
@@ -758,6 +844,30 @@ class DeepSpeedLight(Module):
             self.timers('backward_allreduce_microstep').start()
             self.timers('backward_allreduce').start()
 
+        #qy
+        if self.is_gradient_accumulation_boundary():
+            if self.grad_placeholder is None:
+                self.grad_placeholder=merge_grad(self._get_optimizer_grad())
+            start_time=time.time()
+            self.half_reduce=True
+            self.dp_world_size=int(self.dp_world_size/2)
+            self.world_size=int(self.world_size/2)
+            self.allreduce_gradients()
+            for name, param in self.module.named_parameters():
+                if param.grad is not None:
+                    param.grad.data /= self.world_size
+            self.half_reduce=False
+            self.dp_world_size=int(self.dp_world_size*2)
+            self.world_size=int(self.world_size*2)
+            # print(self.grad_placeholder)
+            if self.global_rank==1:
+                dist.broadcast(merge_grad(self._get_optimizer_grad()),1,group=self.sub_groups[-1])
+            if self.global_rank==0:
+                dist.broadcast(self.grad_placeholder,1,group=self.sub_groups[-1])
+                self.cos_placeholder=torch.nn.functional.cosine_similarity(merge_grad(self._get_optimizer_grad()).float(),self.grad_placeholder.float(),dim=0)
+            torch.distributed.broadcast(self.cos_placeholder,0)
+            self.adapt_print(f"cosine {self.cos_placeholder} computation at micro step {self.micro_steps} takes ",time.time()-start_time)
+
         if allreduce_gradients:
             self.allreduce_gradients()
 
@@ -769,9 +879,80 @@ class DeepSpeedLight(Module):
 
         return loss
 
+    #qy
+
+    def adapt_print(self,*message,**keywords):
+        if self.adaptive_batch_params["verbose"]==1 and dist.get_rank()==0:
+            print(*message,**keywords)
+        elif  self.adaptive_batch_params["verbose"]==2:
+            print(*message,**keywords)
+
+    def change_micro_batch_size(self,new_micro_batch_size_per_gpu):
+        self._config.train_micro_batch_size_per_gpu=new_micro_batch_size_per_gpu
+        self.adapt_print(f"train_micro_batch_size_per_gpu:{self.train_micro_batch_size_per_gpu()}")
+
+    def set_new_lr(self,new_batch_size):
+        new_ratio=math.sqrt(new_batch_size/self.adaptive_batch_params["original_batch_size"])
+        if self.adaptive_batch_params["lr_adjust_factor"] is not None:
+            new_ratio=(new_ratio-1)*self.adaptive_batch_params["lr_adjust_factor"]+1
+        self.adaptive_batch_params["global_lr_modifier"]=new_ratio
+        self.adapt_print(f"The learning rate modifier was updated to {self.adaptive_batch_params['global_lr_modifier']}")
+
+
+    def change_gradient_accumulation_steps(self,new_batch_size):
+        # self.adapt_print(f"self.adaptive_batch_params,{self.adaptive_batch_params}")
+        self.adapt_print(f"Target batch size is {new_batch_size}")
+        if self.adaptive_batch_params["smooth_factor"] is not None:
+            smooth_factor=self.adaptive_batch_params["smooth_factor"]
+            new_batch_size=int(self.gradient_accumulation_steps()*smooth_factor+new_batch_size*(1-smooth_factor))
+        if self.adaptive_batch_params["batch_size_upper_bound"] is not None:
+            new_batch_size=min(new_batch_size,self.adaptive_batch_params["batch_size_upper_bound"])
+        if self.adaptive_batch_params["batch_size_lower_bound"] is not None:#scale up is different
+            if self.adaptive_batch_params["inconsistent_lr_below_lower_bound"] is True:
+                self.latent_batch_size=new_batch_size
+            new_batch_size=max(new_batch_size,self.adaptive_batch_params["batch_size_lower_bound"])
+        if new_batch_size>self.train_batch_size():
+            if self.adaptive_batch_params["max_micro_batch_size"] is not None:
+                new_micro_batch_size=min(max(1,new_batch_size//self.dp_world_size),self.adaptive_batch_params["max_micro_batch_size"])
+                self.change_micro_batch_size(new_micro_batch_size)
+            new_step=max(1,new_batch_size//self.dp_world_size//self.train_micro_batch_size_per_gpu())
+            try:
+                assert self.dp_world_size*new_step*self.train_micro_batch_size_per_gpu()>self.train_batch_size()
+            except:
+                new_step+=1
+        elif new_batch_size<self.train_batch_size():
+            new_step=new_batch_size//self.dp_world_size//self.train_micro_batch_size_per_gpu()
+            try:
+                assert self.dp_world_size*new_step*self.train_micro_batch_size_per_gpu()<self.train_batch_size()
+            except:
+                if self.adaptive_batch_params["max_micro_batch_size"] is not None:
+                    new_micro_batch_size=min(max(1,new_batch_size//self.dp_world_size//new_step),self.adaptive_batch_params["max_micro_batch_size"])
+                    self.change_micro_batch_size(new_micro_batch_size)
+                else:
+                    new_step-=1
+        else:
+            new_step=self.gradient_accumulation_steps()
+        new_step=max(1,new_step)
+
+        self._config.gradient_accumulation_steps=int(new_step)
+        self.gradient_accumulation_offset=(self.micro_steps+1)%self.gradient_accumulation_steps()
+        self.gradient_accumulation_start=self.micro_steps+self.gradient_accumulation_steps()
+        new_batch_size=self.dp_world_size*self.gradient_accumulation_steps()*self.train_micro_batch_size_per_gpu()
+        self._config.train_batch_size=int(new_batch_size)
+        if self.adaptive_batch_params["disable_lr_adjust"] is not True:
+            if self.adaptive_batch_params["inconsistent_lr_below_lower_bound"]:
+                self.set_new_lr(self.latent_batch_size)
+            else:
+                self.set_new_lr(self.train_batch_size())
+        self.adapt_print(f"New gradient_accumulation_steps {self.gradient_accumulation_steps()}")
+        self.adapt_print(f"The offset has been updated to {self.gradient_accumulation_offset}, the next update is set to be {self.gradient_accumulation_start}, ",end="")
+
     def is_gradient_accumulation_boundary(self):
-        return (self.micro_steps + 1) % \
-            self.gradient_accumulation_steps() == 0
+        if self.micro_steps>=self.gradient_accumulation_start:
+            return (self.micro_steps + 1-self.gradient_accumulation_offset) % \
+                self.gradient_accumulation_steps() == 0
+        else:
+            return False
 
     def zero_grad(self):
         """
@@ -795,12 +976,30 @@ class DeepSpeedLight(Module):
                                            "init in order to use step"
         report_progress = self.global_rank == 0 if self.global_rank else True
 
+
+
         if self.is_gradient_accumulation_boundary():
 
             if not self.fp16_enabled() and self.gradient_clipping() > 0.0:
                 self.clip_fp32_gradients()
 
+            if self.adaptive_batch_params["enable_adjust"] is True:
+                if hasattr(self.optimizer,"optimizer"):
+                    for param_group in self.optimizer.optimizer.param_groups:
+                        param_group['lr']*=self.adaptive_batch_params["global_lr_modifier"]
+                else:
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr']*=self.adaptive_batch_params["global_lr_modifier"]
+
             self.optimizer.step()
+
+            if self.adaptive_batch_params["enable_adjust"] is True:
+                if hasattr(self.optimizer,"optimizer"):
+                    for param_group in self.optimizer.optimizer.param_groups:
+                        param_group['lr']/=self.adaptive_batch_params["global_lr_modifier"]
+                else:
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr']/=self.adaptive_batch_params["global_lr_modifier"]
 
             #zero grad in basic optimizer could be unreliable and may not exhibit
             #the behaviour that we want
@@ -825,6 +1024,66 @@ class DeepSpeedLight(Module):
 
             self.global_steps += 1
 
+            #qy
+                # msg=f", step size changed from {self.gradient_step_size}"
+                # if(self.cos_placeholder<similarity_target):
+                #     self.change_gradient_accumulation_steps(max(1,self.gradient_accumulation_steps()+self.gradient_step_size))
+                #     if(self.adjust_direction>0):
+                #         self.gradient_step_size+=0.5
+                #     else:
+                #         self.gradient_step_size=max(1,self.gradient_step_size-1)
+                #     self.adjust_direction=1
+                # elif(self.cos_placeholder>similarity_target and self.gradient_accumulation_steps()>1):
+                #     self.change_gradient_accumulation_steps(max(1,self.gradient_accumulation_steps()-self.gradient_step_size))
+                #     if(self.adjust_direction>0):
+                #         self.gradient_step_size=max(self.gradient_step_size-1,1)
+                #     else:
+                #         self.gradient_step_size+=0.5
+                #     self.adjust_direction=-1
+            if self.adaptive_batch_params["enable_adjust"]:
+                self.adaptive_batch_params["batch_size_similiarity_record"][self.train_batch_size()]=self.cos_placeholder.item()
+                if self.adaptive_batch_params["inconsistent_lr_below_lower_bound"]:
+                    raise NotImplementedError
+                    # self.adapt_print(f"Current cos similiarity {self.cos_placeholder} latent gradient step changed from {self.latent_batch_size} ")
+
+                    # if(self.cos_placeholder<self.adaptive_batch_params["similarity_target"]):
+                    #     self.change_gradient_accumulation_steps(max(1,self.latent_batch_size+1,int(self.latent_batch_size*1.1)))
+                    # elif(self.cos_placeholder>self.adaptive_batch_params["similarity_target"] and self.latent_batch_size>1):
+                    #     self.change_gradient_accumulation_steps(max(1,min(self.latent_batch_size-1,int(self.latent_batch_size*0.9))))
+                    # # self.adapt_print(f" to {self.gradient_accumulation_steps()}"+msg+f" to {self.gradient_step_size}")
+                    # self.adapt_print(f"New latent gradient accumulation step {self.latent_batch_size}")
+                else:
+                    self.adapt_print(f"Current cos similiarity {self.cos_placeholder} for batch size {self.train_batch_size()} ")
+                    if self.adaptive_batch_params["batch_sizes_to_profile"] is not None and len(self.adaptive_batch_params["batch_sizes_to_profile"])>0:
+                        if self.adaptive_batch_params["batch_size_before_profile"] is None:
+                            self.adaptive_batch_params["batch_size_before_profile"]=self.train_batch_size()
+                            self.adapt_print(f"Current batch size {self.train_batch_size()} is saved. Now the batch size profiling starts.")
+                        self.change_gradient_accumulation_steps(self.adaptive_batch_params["batch_sizes_to_profile"].pop())
+                    else:
+                        if self.adaptive_batch_params["batch_sizes_to_profile"] is not None and len(self.adaptive_batch_params["batch_sizes_to_profile"])==0:
+                            self.adaptive_batch_params["batch_sizes_to_profile"]=None
+                            #update similarity
+                            self.change_gradient_accumulation_steps(self.adaptive_batch_params["batch_size_before_profile"])
+                            self.adaptive_batch_params["batch_size_before_profile"]=None
+                            self.adapt_print(f"Previous batch size {self.train_batch_size()} is restored. Now the batch size profiling ends.")
+                            if dist.get_rank()==0:
+                                i=0
+                                while True:
+                                    i+=1
+                                    if os.path.exists(f"batch_size_profiled{i}.npy"):
+                                        continue
+                                    else:
+                                        np.save(f"batch_size_profiled{i}.npy",self.adaptive_batch_params["batch_size_similiarity_record"])
+                                        self.adaptive_batch_params["batch_size_similiarity_record"]=dict()
+                                        break
+                        else:
+                            if(self.cos_placeholder<self.adaptive_batch_params["similarity_target"]):
+                                self.change_gradient_accumulation_steps(max(1,self.train_batch_size()+1,int(self.train_batch_size()*1.1)))
+                            elif(self.cos_placeholder>self.adaptive_batch_params["similarity_target"] and self.train_batch_size()>1):
+                                self.change_gradient_accumulation_steps(max(1,min(self.train_batch_size()-1,int(self.train_batch_size()*0.9))))
+                            # self.adapt_print(f" to {self.train_batch_size()}"+msg+f" to {self.gradient_step_size}")
+                    self.adapt_print(f"New train batch size {self.train_batch_size()}")
+
         self.tput_timer.stop(report_progress)
 
         # Log learning rate
@@ -833,6 +1092,9 @@ class DeepSpeedLight(Module):
                 if self.global_rank == 0:
                     self.summary_events = [(f'Train/Samples/lr',
                                             self.get_lr()[0],
+                                            self.sample_count),
+                                            (f'Train/Samples/gradient_accumulation_steps',
+                                            self.gradient_accumulation_steps(),
                                             self.sample_count)]
                     for event in self.summary_events:  # write_summary_events
                         self.summary_writer.add_scalar(event[0], event[1], event[2])
@@ -883,6 +1145,26 @@ class DeepSpeedLight(Module):
                 result.append(0.0)
         return result
 
+    #qy:https://github.com/microsoft/DeepSpeed/blob/e1bea67f2b27891df35aa54d9d2b25b60c377619/deepspeed/pt/fp16_unfused_optimizer.py#L49
+    def _get_optimizer_grad(self):
+        result = []
+        if not self.optimizer:
+            return result
+        if hasattr(self.optimizer, 'fp16_groups'):
+            for group in self.optimizer.fp16_groups:
+                for p in group:
+                    if p.grad is not None:
+                        result.append(p.grad)
+            return result
+        else:
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    if p.grad is not None:
+                        result.append(p.grad)
+            return result
+
+
+
     def get_lr(self):
         return self._get_optimizer_param('lr')
 
@@ -911,7 +1193,11 @@ class DeepSpeedLight(Module):
             if self.gradient_predivide_factor() != 1.0:
                 tensor_to_allreduce.mul_(1. / self.gradient_predivide_factor())
 
-            dist.all_reduce(tensor_to_allreduce, group=self.data_parallel_group)
+            #qy
+            if self.half_reduce:
+                dist.all_reduce(tensor_to_allreduce, group=self.sub_groups[self.global_rank%2])
+            else:
+                dist.all_reduce(tensor_to_allreduce, group=self.data_parallel_group)
 
             if self.gradient_average:
                 if self.gradient_predivide_factor() != self.dp_world_size:
@@ -919,7 +1205,10 @@ class DeepSpeedLight(Module):
                                              self.dp_world_size)
         else:
             tensor_to_allreduce.div_(self.dp_world_size)
-            dist.all_reduce(tensor_to_allreduce, group=self.data_parallel_group)
+            if self.half_reduce:
+                dist.all_reduce(tensor_to_allreduce, group=self.sub_groups[self.global_rank%2])
+            else:
+                dist.all_reduce(tensor_to_allreduce, group=self.data_parallel_group)
 
         if self.allreduce_always_fp32() and tensor is not tensor_to_allreduce:
             tensor.copy_(tensor_to_allreduce)
@@ -1116,6 +1405,25 @@ class DeepSpeedLight(Module):
         self.csr_tensor_module_names = checkpoint['csr_tensor_module_names']
         self.global_steps = checkpoint['global_steps']
         self.skipped_steps = checkpoint['skipped_steps']
+
+        #qy
+        self._config.gradient_accumulation_steps=checkpoint['gradient_accumulation_steps']
+        self.gradient_accumulation_offset=checkpoint['gradient_accumulation_offset']
+        self.gradient_accumulation_start=checkpoint['gradient_accumulation_start']
+        self.adaptive_batch_params=defaultdict(lambda: None,checkpoint['adaptive_batch_params'])
+        if "micro_steps" in checkpoint:
+            self.micro_steps = checkpoint['micro_steps']
+        else:
+            self.gradient_accumulation_offset=0
+            self.gradient_accumulation_start=0
+        
+
+
+        print("self._config.gradient_accumulation_steps",self._config.gradient_accumulation_steps)
+        print("self.gradient_accumulation_offset",self.gradient_accumulation_offset)
+        print("self.gradient_accumulation_start",self.gradient_accumulation_start)
+        print("self.adaptive_batch_params",self.adaptive_batch_params)
+
         deepspeed_states = [
             'module',
             'optimizer',
@@ -1190,6 +1498,7 @@ class DeepSpeedLight(Module):
         save_path = self._get_ckpt_name(save_dir, tag)
         #self._ensure_directory_exists(save_path)
 
+        #qy
         state = {
             'module':
             self.module_state_dict(),
@@ -1204,6 +1513,12 @@ class DeepSpeedLight(Module):
             self.skipped_steps,
             'global_steps':
             self.global_steps,
+            #qy
+            'gradient_accumulation_steps':self._config.gradient_accumulation_steps,
+            'gradient_accumulation_offset':self.gradient_accumulation_offset,
+            'gradient_accumulation_start':self.gradient_accumulation_start,
+            'adaptive_batch_params':dict(self.adaptive_batch_params),
+            'micro_steps':self.micro_steps,
         }
         state.update(client_state)
 

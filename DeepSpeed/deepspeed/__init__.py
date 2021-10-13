@@ -38,7 +38,8 @@ def initialize(args,
                mpu=None,
                dist_init_required=None,
                collate_fn=None,
-               config_params=None):
+               config_params=None,
+               adaptive_batch_params=None):
     """Initialize the DeepSpeed Engine.
 
     Arguments:
@@ -97,7 +98,8 @@ def initialize(args,
                             mpu=mpu,
                             dist_init_required=dist_init_required,
                             collate_fn=collate_fn,
-                            config_params=config_params)
+                            config_params=config_params,
+                            adaptive_batch_params=adaptive_batch_params)
 
     return_items = [
         engine,
