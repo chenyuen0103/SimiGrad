@@ -1,4 +1,4 @@
-## Anonymous repo created for NIPS submission "SimiGrad: Fine-Grained Adaptive Batching for Large Scale Training using Gradient Similarity Measurement"
+## Public Code for NIPS submission "SimiGrad: Fine-Grained Adaptive Batching for Large Scale Training using Gradient Similarity Measurement"
 This repo contains both our SimiGrad framework (integrated with DeepSpeed) and all training codes used to generate the results in the paper.
 ## Installation
 Please use `./DeepSpeed/install.sh` to install our SimiGrad framework. For detailed installation options please see `./DeepSpeed/install.sh` . It is recommended that you use a virtual environment to install SimiGrad.
