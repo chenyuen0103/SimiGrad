@@ -1,4 +1,4 @@
-## Public Code for NIPS submission "SimiGrad: Fine-Grained Adaptive Batching for Large Scale Training using Gradient Similarity Measurement"
+## Public code for NIPS submission "SimiGrad: Fine-Grained Adaptive Batching for Large Scale Training using Gradient Similarity Measurement"
 This repo contains both our SimiGrad framework (integrated with DeepSpeed) and all training codes used to generate the results in the paper.
 ## Installation
 Please use `./DeepSpeed/install.sh` to install our SimiGrad framework. For detailed installation options please see `./DeepSpeed/install.sh` . It is recommended that you use a virtual environment to install SimiGrad.
@@ -33,5 +33,5 @@ All scripts can be found in `DeepSpeedExamples/pytorch-cifar/`. Use the script `
 ### ResNet50 on ImageNet
 All scripts can be found in `DeepSpeedExamples/imagenet_deepspeed/`. Use the script `run_with2kmin.sh` to train ResNet50 with spcific parameters.
 
-## Anonymity of this Repo
-We have removed all information that may lead to our identity from the code. This repo is uploaded by an anonymous account with a forward email address to ensure anonymity.
+## Future of SimiGrad
+SimiGrad will be officially integrated as part of DeepSpeed soon!
