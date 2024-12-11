@@ -1,2 +1,2 @@
-git_hash = 'fd2a8fd'
-git_branch = 'master'
+git_hash = '0376ef0d'
+git_branch = 'HEAD'

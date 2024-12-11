@@ -1,10 +1,19 @@
-# torch>=1.2
-# torchvision>=0.4.0
-pillow==6.2.2
-tqdm
-psutil
-tensorboardX==1.8
-pytest
-pytest-forked
-pre-commit
-clang-format
+torch>=2.0.0      # Updated to ensure compatibility with modern PyTorch versions
+torchvision>=0.15.0  # Matches modern Torch versions
+pillow>=9.0.0     # Modern version of Pillow for image processing
+tqdm              # For progress bar visualization
+psutil            # For system monitoring
+tensorboard>=2.0  # Tensorboard for logging
+pytest            # Testing framework
+pytest-forked     # For isolated test execution
+pre-commit        # For code formatting and checks
+clang-format      # For C++ code formatting
+einops            # For tensor rearrangement (required by DeepSpeed)
+hjson             # For human-readable JSON (used in DeepSpeed configurations)
+msgpack           # Efficient binary serialization
+ninja             # Build system for CUDA extensions
+numpy             # Core scientific computing library
+packaging>=20.0   # Ensures compatibility with packaging standards
+py-cpuinfo        # CPU information for compatibility checks
+pydantic>=2.0.0   # Validation library required by DeepSpeed
+nvidia-ml-py      # NVIDIA Management Library bindings
